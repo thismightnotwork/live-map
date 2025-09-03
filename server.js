@@ -1,104 +1,89 @@
 import express from "express";
-import fetch from "node-fetch";
-import { WebSocketServer } from "ws";
+import cors from "cors";
+import axios from "axios";
+import { MongoClient } from "mongodb";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(cors());
+app.use(express.json());
 
-// Serve static files (your HTML page)
-app.use(express.static("public"));
+// --- MongoDB ---
+const uri = process.env.MONGO_URI;
+const client = new MongoClient(uri);
+const dbName = "skyreachDB";
+let flightsCollection;
 
-// Store aircraft data in memory
-// id -> { flightData, trail: [{lat, lon, alt, t}] }
-const aircraftStore = new Map();
-
-// Fetch intervals (15s)
-const REFRESH_MS = 15000;
-const TRAIL_MAX_POINTS = 120;
-const TRAIL_PRUNE_MS = 60 * 60 * 1000; // 1 hour
-
-// Helper: Generate unique ID
-function idFor(f) {
-  const cid = f.cid || f.userId || f.id;
-  return `${f.network}:${cid || f.callsign || Math.random().toString(36).slice(2)}`;
+async function connectDB() {
+  await client.connect();
+  console.log("Connected to MongoDB");
+  const db = client.db(dbName);
+  flightsCollection = db.collection("flights");
 }
+connectDB();
 
-// Fetch IVAO flights
+// --- Fetch flights ---
 async function getIVAOFlights() {
   try {
-    const tokenRes = await fetch('https://ivao-token-server.onrender.com/token');
-    const token = (await tokenRes.json()).token;
-    const res = await fetch('https://api.ivao.aero/v2/tracker/whazzup', {
+    const tokenRes = await axios.get('https://ivao-token-server.onrender.com/token');
+    const token = tokenRes.data.token;
+    const res = await axios.get('https://api.ivao.aero/v2/tracker/whazzup', {
       headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' }
     });
-    const js = await res.json();
-    return js.clients.pilots.map(f => ({ ...f, network: 'IVAO' }));
-  } catch (e) { console.error('IVAO fetch error:', e); return []; }
+    return res.data.clients.pilots.map(f => ({ ...f, network: 'IVAO' }));
+  } catch (e) {
+    console.error("IVAO fetch error:", e.message);
+    return [];
+  }
 }
 
-// Fetch VATSIM flights
 async function getVATSIMFlights() {
   try {
-    const res = await fetch('https://data.vatsim.net/v3/vatsim-data.json');
-    const js = await res.json();
-    return js.pilots.map(f => ({ ...f, network: 'VATSIM' }));
-  } catch (e) { console.error('VATSIM fetch error:', e); return []; }
+    const res = await axios.get('https://data.vatsim.net/v3/vatsim-data.json');
+    return res.data.pilots.map(f => ({ ...f, network: 'VATSIM' }));
+  } catch (e) {
+    console.error("VATSIM fetch error:", e.message);
+    return [];
+  }
 }
 
-// Update stored aircraft
-async function updateAircraftStore() {
+// --- Update MongoDB ---
+async function updateFlights() {
   const [ivao, vatsim] = await Promise.all([getIVAOFlights(), getVATSIMFlights()]);
-  const all = ivao.concat(vatsim);
+  const allFlights = [...ivao, ...vatsim];
   const now = Date.now();
-  const seen = new Set();
 
-  for (const f of all) {
-    const id = idFor(f);
-    seen.add(id);
+  for (let f of allFlights) {
+    const id = `${f.network}:${f.cid || f.userId || f.callsign || Math.random().toString(36).slice(2)}`;
     const pos = {
       lat: f.latitude ?? f.lastTrack?.latitude,
       lon: f.longitude ?? f.lastTrack?.longitude,
       alt: f.altitude ?? f.lastTrack?.altitude,
+      gs: f.groundspeed ?? f.lastTrack?.groundSpeed,
+      hdg: f.heading ?? f.lastTrack?.heading,
       t: now
     };
-
-    if (!aircraftStore.has(id)) {
-      aircraftStore.set(id, { flightData: f, trail: [pos] });
-    } else {
-      const entry = aircraftStore.get(id);
-      entry.flightData = f;
-      entry.trail.push(pos);
-      if (entry.trail.length > TRAIL_MAX_POINTS) entry.trail.splice(0, entry.trail.length - TRAIL_MAX_POINTS);
-      // prune old
-      while (entry.trail.length && entry.trail[0].t < now - TRAIL_PRUNE_MS) entry.trail.shift();
-    }
+    await flightsCollection.updateOne(
+      { _id: id },
+      { $push: { trail: pos }, $set: { callsign: f.callsign, network: f.network, lastSeen: now } },
+      { upsert: true }
+    );
   }
 
-  // Remove disconnected aircraft
-  for (const id of aircraftStore.keys()) {
-    if (!seen.has(id)) aircraftStore.delete(id);
-  }
-
-  // Broadcast updates
-  broadcastAircraftData();
+  await flightsCollection.deleteMany({ lastSeen: { $lt: now - 5 * 60 * 1000 } });
 }
 
-// --- WebSocket Server ---
-const wss = new WebSocketServer({ noServer: true });
-function broadcastAircraftData() {
-  const data = Array.from(aircraftStore.values()).map(e => e.flightData);
-  const payload = JSON.stringify({ flights: data });
-  wss.clients.forEach(client => {
-    if (client.readyState === 1) client.send(payload);
-  });
-}
+setInterval(updateFlights, 15000);
 
-app.server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-// Handle WebSocket upgrade
-app.server.on('upgrade', (req, socket, head) => {
-  wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+// --- API ---
+app.get("/api/flights", async (req, res) => {
+  const flights = await flightsCollection.find({}).toArray();
+  res.json(flights);
 });
 
-// Start update loop
-setInterval(updateAircraftStore, REFRESH_MS);
+app.get("/api/flights/:id", async (req, res) => {
+  const flight = await flightsCollection.findOne({ _id: req.params.id });
+  res.json(flight || null);
+});
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
