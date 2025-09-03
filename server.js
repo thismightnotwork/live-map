@@ -1,89 +1,124 @@
 import express from "express";
+import mongoose from "mongoose";
+import fetch from "node-fetch";
 import cors from "cors";
-import axios from "axios";
-import { MongoClient } from "mongodb";
 
 const app = express();
 app.use(cors());
-app.use(express.json());
 
-// --- MongoDB ---
-const uri = process.env.MONGO_URI;
-const client = new MongoClient(uri);
-const dbName = "skyreachDB";
-let flightsCollection;
+// ===== MongoDB Setup =====
+const mongoUri = process.env.MONGO_URI;
+await mongoose.connect(mongoUri, { useNewUrlParser: true, useUnifiedTopology: true });
 
-async function connectDB() {
-  await client.connect();
-  console.log("Connected to MongoDB");
-  const db = client.db(dbName);
-  flightsCollection = db.collection("flights");
-}
-connectDB();
+const trailSchema = new mongoose.Schema({
+  flightId: String,
+  points: [
+    {
+      lat: Number,
+      lon: Number,
+      timestamp: Date
+    }
+  ]
+});
 
-// --- Fetch flights ---
-async function getIVAOFlights() {
-  try {
-    const tokenRes = await axios.get('https://ivao-token-server.onrender.com/token');
-    const token = tokenRes.data.token;
-    const res = await axios.get('https://api.ivao.aero/v2/tracker/whazzup', {
-      headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' }
-    });
-    return res.data.clients.pilots.map(f => ({ ...f, network: 'IVAO' }));
-  } catch (e) {
-    console.error("IVAO fetch error:", e.message);
-    return [];
-  }
+const Trail = mongoose.model("Trail", trailSchema);
+
+// ===== Helpers =====
+function makeId(f) {
+  return `${f.network}:${f.cid || f.callsign || Math.random().toString(36).slice(2)}`;
 }
 
-async function getVATSIMFlights() {
-  try {
-    const res = await axios.get('https://data.vatsim.net/v3/vatsim-data.json');
-    return res.data.pilots.map(f => ({ ...f, network: 'VATSIM' }));
-  } catch (e) {
-    console.error("VATSIM fetch error:", e.message);
-    return [];
-  }
+function normalize(f, network) {
+  return {
+    id: makeId(f),
+    network,
+    cid: f.cid || null,
+    callsign: f.callsign || f.flight_id || "N/A",
+    latitude: f.latitude,
+    longitude: f.longitude,
+    altitude: f.altitude || 0,
+    groundspeed: f.groundspeed || 0,
+    heading: f.heading || 0,
+    timestamp: new Date()
+  };
 }
 
-// --- Update MongoDB ---
+// ===== Live flights memory cache =====
+let liveFlights = [];
+
+// ===== Update flights every 5s =====
 async function updateFlights() {
-  const [ivao, vatsim] = await Promise.all([getIVAOFlights(), getVATSIMFlights()]);
-  const allFlights = [...ivao, ...vatsim];
-  const now = Date.now();
+  try {
+    const [ivaoRes, vatsimRes] = await Promise.all([
+      fetch("https://api.ivao.aero/v2/tracker/whazzup"),
+      fetch("https://data.vatsim.net/v3/vatsim-data.json")
+    ]);
+    const ivao = await ivaoRes.json();
+    const vatsim = await vatsimRes.json();
 
-  for (let f of allFlights) {
-    const id = `${f.network}:${f.cid || f.userId || f.callsign || Math.random().toString(36).slice(2)}`;
-    const pos = {
-      lat: f.latitude ?? f.lastTrack?.latitude,
-      lon: f.longitude ?? f.lastTrack?.longitude,
-      alt: f.altitude ?? f.lastTrack?.altitude,
-      gs: f.groundspeed ?? f.lastTrack?.groundSpeed,
-      hdg: f.heading ?? f.lastTrack?.heading,
-      t: now
-    };
-    await flightsCollection.updateOne(
-      { _id: id },
-      { $push: { trail: pos }, $set: { callsign: f.callsign, network: f.network, lastSeen: now } },
-      { upsert: true }
-    );
+    const flights = [];
+
+    // IVAO
+    if (ivao.clients) {
+      for (const f of ivao.clients.pilots || []) {
+        if (f.latitude && f.longitude) {
+          flights.push(normalize(f, "IVAO"));
+        }
+      }
+    }
+
+    // VATSIM
+    if (vatsim.pilots) {
+      for (const f of vatsim.pilots) {
+        if (f.latitude && f.longitude) {
+          flights.push(normalize(f, "VATSIM"));
+        }
+      }
+    }
+
+    liveFlights = flights;
+
+    // Save trails to MongoDB
+    for (const f of flights) {
+      const { id, latitude, longitude } = f;
+      if (!latitude || !longitude) continue;
+
+      await Trail.findOneAndUpdate(
+        { flightId: id },
+        { $push: { points: { lat: latitude, lon: longitude, timestamp: new Date() } } },
+        { upsert: true }
+      );
+
+      // prune: keep last 200 points
+      await Trail.updateOne(
+        { flightId: id },
+        { $push: { points: { $each: [], $slice: -200 } } }
+      );
+    }
+
+    console.log(`[update] stored ${flights.length} flights`);
+  } catch (err) {
+    console.error("Error updating flights:", err);
   }
-
-  await flightsCollection.deleteMany({ lastSeen: { $lt: now - 5 * 60 * 1000 } });
 }
 
-setInterval(updateFlights, 15000);
+setInterval(updateFlights, 5000);
+updateFlights();
 
-// --- API ---
-app.get("/api/flights", async (req, res) => {
-  const flights = await flightsCollection.find({}).toArray();
-  res.json(flights);
+// ===== Routes =====
+app.get("/flights", (req, res) => {
+  res.json(liveFlights);
 });
 
-app.get("/api/flights/:id", async (req, res) => {
-  const flight = await flightsCollection.findOne({ _id: req.params.id });
-  res.json(flight || null);
+app.get("/trails/:id", async (req, res) => {
+  try {
+    const t = await Trail.findOne({ flightId: req.params.id });
+    res.json(t ? t.points : []);
+  } catch (err) {
+    res.status(500).json({ error: "db error" });
+  }
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// ===== Start =====
+const port = process.env.PORT || 10000;
+app.listen(port, () => console.log(`Server running on port ${port}`));
